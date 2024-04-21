@@ -249,7 +249,7 @@ def test(model, criterion, data_loader):
     acc = float(total_correct) / len(data_loader.dataset)
     return loss, acc
 
-def test_gaussian(plot_id, model, criterion, data_loader, num_classes):
+def test_gaussian(plot_id, model, criterion, data_loader, num_classes=10):
     model.eval()
     total_correct = 0
     total_loss = 0.0
