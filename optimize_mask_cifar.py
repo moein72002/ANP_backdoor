@@ -10,6 +10,11 @@ import torchvision.transforms as transforms
 
 import models
 import data.poison_cifar as poison
+from data.gaussian_dataset import GaussianNoiseDataset
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
 
 parser = argparse.ArgumentParser(description='Train poisoned networks')
 
@@ -75,6 +80,8 @@ def main():
     orig_train = CIFAR10(root=args.data_dir, train=True, download=True, transform=transform_train)
     _, clean_val = poison.split_dataset(dataset=orig_train, val_frac=args.val_frac,
                                         perm=np.loadtxt('./data/cifar_shuffle.txt', dtype=int))
+    gaussian_test = GaussianNoiseDataset(image_size=(3, 32, 32), length=len(clean_val))
+    print(f"len(gaussian_test): {len(gaussian_test)}")
     clean_test = CIFAR10(root=args.data_dir, train=False, download=True, transform=transform_test)
     poison_test = poison.add_predefined_trigger_cifar(data_set=clean_test, trigger_info=trigger_info)
 
@@ -82,6 +89,7 @@ def main():
                                    num_samples=args.print_every * args.batch_size)
     clean_val_loader = DataLoader(clean_val, batch_size=args.batch_size,
                                   shuffle=False, sampler=random_sampler, num_workers=0)
+    gaussian_test_loader = DataLoader(gaussian_test, batch_size=args.batch_size, num_workers=0)
     poison_test_loader = DataLoader(poison_test, batch_size=args.batch_size, num_workers=0)
     clean_test_loader = DataLoader(clean_test, batch_size=args.batch_size, num_workers=0)
 
@@ -101,11 +109,19 @@ def main():
     # Step 3: train backdoored models
     print('Iter \t lr \t Time \t TrainLoss \t TrainACC \t PoisonLoss \t PoisonACC \t CleanLoss \t CleanACC')
     nb_repeat = int(np.ceil(args.nb_iter / args.print_every))
+    gauss_test_loss, gauss_test_acc = test_gaussian(plot_id=0, model=net, criterion=criterion,
+                                                    data_loader=gaussian_test_loader)
+    print(f"gauss_test_loss: {gauss_test_loss}")
+    print(f"gauss_test_acc: {gauss_test_acc}")
     for i in range(nb_repeat):
         start = time.time()
         lr = mask_optimizer.param_groups[0]['lr']
         train_loss, train_acc = mask_train(model=net, criterion=criterion, data_loader=clean_val_loader,
                                            mask_opt=mask_optimizer, noise_opt=noise_optimizer)
+
+        gauss_test_loss, gauss_test_acc = test_gaussian(plot_id=i+1, model=net, criterion=criterion, data_loader=gaussian_test_loader)
+        print(f"gauss_test_loss: {gauss_test_loss}")
+        print(f"gauss_test_acc: {gauss_test_acc}")
         cl_test_loss, cl_test_acc = test(model=net, criterion=criterion, data_loader=clean_test_loader)
         po_test_loss, po_test_acc = test(model=net, criterion=criterion, data_loader=poison_test_loader)
         end = time.time()
@@ -232,6 +248,86 @@ def test(model, criterion, data_loader):
     loss = total_loss / len(data_loader)
     acc = float(total_correct) / len(data_loader.dataset)
     return loss, acc
+
+def test_gaussian(plot_id, model, criterion, data_loader, num_classes):
+    model.eval()
+    total_correct = 0
+    total_loss = 0.0
+    gt_labels = np.zeros(num_classes)
+    predicted_classes = np.zeros(num_classes)
+    max_probabilities = []
+    with torch.no_grad():
+        for i, (images, labels) in enumerate(data_loader):
+            images, labels = images.to(device), labels.to(device)
+            output = model(images)
+            total_loss += criterion(output, labels).item()
+
+            probs = F.softmax(output, dim=1)
+            max_probs = torch.max(probs, dim=1)[0]  # Extract max probabilities
+            max_probabilities.extend(max_probs.tolist())  # Store in list
+
+            pred = output.data.max(1)[1]
+            total_correct += pred.eq(labels.data.view_as(pred)).sum()
+            for label, prediction in zip(labels, pred):
+                gt_labels[label.item()] += 1
+                predicted_classes[prediction.item()] += 1
+
+    # Calculate accuracy and loss
+    loss = total_loss / len(data_loader)
+    acc = float(total_correct) / len(data_loader.dataset)
+
+    fig, ax = plt.subplots()
+    # Increase the gap between classes by manipulating the indices
+    index = np.arange(0, num_classes * 4, 4)  # Doubling the space between class groups
+    bar_width = 1.5  # Wide bars for better visibility
+
+    opacity = 0.8
+
+    # Bar groups are closely packed within each class, but spaced out between classes
+    rects1 = ax.bar(index, gt_labels, bar_width,
+                    alpha=opacity, color='b', label='Ground Truth')
+
+    rects2 = ax.bar(index + bar_width, predicted_classes, bar_width,
+                    alpha=opacity, color='g', label='Predictions')
+
+    ax.set_xlabel('Classes')
+    ax.set_ylabel('Counts')
+    ax.set_title('Comparison of Ground Truth and Predicted Classes')
+    # Set x-ticks to be in the middle of the groups
+    ax.set_xticks(index + bar_width / 4)
+    ax.set_xticklabels([str(i) for i in range(num_classes)])
+    ax.legend()
+
+    # Adding text labels
+    def add_labels(rects):
+        for rect in rects:
+            height = rect.get_height()
+            ax.annotate('{}'.format(height),
+                        xy=(rect.get_x() + rect.get_width() / 2, height),
+                        xytext=(0, 3),  # 3 points vertical offset
+                        textcoords="offset points",
+                        ha='center', va='bottom')
+
+    add_labels(rects1)
+    add_labels(rects2)
+
+    plt.tight_layout()
+    plt.savefig(f'class_comparison_{plot_id}.png')  # Save the plot as a PNG file
+    plt.close()
+
+    # Plotting max probabilities histogram
+    plot_max_probabilities_histogram(max_probabilities, plot_id=plot_id)
+
+    return loss, acc
+
+def plot_max_probabilities_histogram(max_probabilities, plot_id=0):
+    plt.figure()
+    plt.hist(max_probabilities, bins=10, color='skyblue', edgecolor='black')
+    plt.title('Histogram of Maximum Class Probabilities')
+    plt.xlabel('Probability')
+    plt.ylabel('Frequency')
+    plt.savefig(f'max_prob_histogram_{plot_id}.png')  # Save the histogram as a PNG file
+    plt.close()
 
 
 def save_mask_scores(state_dict, file_name):
